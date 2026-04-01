@@ -20,11 +20,25 @@ The agent stops. You have to wait hours, come back, and type "continue". If you'
 
 ## The Solution
 
+### Quick Install (Download)
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/PedroRossi/ai-cli-auto-retry/main/ai-cli-auto-retry -o ~/.local/bin/ai-cli-auto-retry
 chmod +x ~/.local/bin/ai-cli-auto-retry
 ai-cli-auto-retry install
 ```
+
+### Development Install (Symlink)
+
+```bash
+git clone https://github.com/PedroRossi/ai-cli-auto-retry
+cd ai-cli-auto-retry
+chmod +x ai-cli-auto-retry
+ln -s "$PWD/ai-cli-auto-retry" ~/.local/bin/ai-cli-auto-retry
+ai-cli-auto-retry install
+```
+
+The symlink approach lets you edit the script and test changes immediately without re-copying.
 
 That's it. Use `pi` or `claude` as you always do. When a rate limit hits, the tool:
 
