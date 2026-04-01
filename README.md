@@ -21,7 +21,7 @@ The agent stops. You have to wait hours, come back, and type "continue". If you'
 ## The Solution
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/your-user/auto-retry/main/auto-retry -o ~/.local/bin/auto-retry
+curl -fsSL https://raw.githubusercontent.com/PedroRossi/ai-cli-auto-retry/main/ai-cli-auto-retry -o ~/.local/bin/ai-cli-auto-retry
 chmod +x ~/.local/bin/ai-cli-auto-retry
 ai-cli-auto-retry install
 ```
