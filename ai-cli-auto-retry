@@ -1,0 +1,1082 @@
+#!/usr/bin/env bash
+# ai-cli-auto-retry — Universal rate-limit auto-retry & model switching for coding agents
+# Works with pi, claude, and any CLI tool that shows rate-limit messages in tmux.
+# https://github.com/your-user/ai-cli-auto-retry
+#
+# MIT License
+
+set -uo pipefail
+
+VERSION="0.1.0"
+CONFIG_FILE="${CONFIG_FILE:-${AUTO_RETRY_CONFIG:-$HOME/.ai-cli-auto-retry.json}}"
+LOG_DIR="$HOME/.ai-cli-auto-retry/logs"
+STATE_DIR="$HOME/.ai-cli-auto-retry/state"
+MARKER_START="# >>> ai-cli-auto-retry >>>"
+MARKER_END="# <<< ai-cli-auto-retry <<<"
+SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+# ── Defaults ───────────────────────────────────────────────────────────────────
+
+CFG_MAX_RETRIES=5
+CFG_POLL_INTERVAL=5
+CFG_MARGIN_SECONDS=60
+CFG_FALLBACK_WAIT_HOURS=5
+CFG_RETRY_MESSAGE="Continue where you left off. The previous attempt was rate limited."
+CFG_LOG_RETENTION_DAYS=7
+CFG_TARGETS="pi claude"
+CFG_FOREGROUND_CMDS="node claude pi npx tsx bun deno python"
+
+CFG_MODEL_SWITCH_ENABLED="false"
+CFG_MODEL_SWITCH_CHAIN=""
+CFG_MODEL_SWITCH_CMD="/model"
+CFG_MODEL_SWITCH_RESTORE="true"
+CFG_MODEL_SWITCH_DELAY=3
+
+CFG_CUSTOM_PATTERNS=""
+
+# ── JSON Helpers ───────────────────────────────────────────────────────────────
+# Lightweight JSON field extraction. Uses jq if available, falls back to grep/sed.
+
+_has_jq=""
+_jq_checked=""
+
+has_jq() {
+    if [ -z "$_jq_checked" ]; then
+        _jq_checked=1
+        if command -v jq >/dev/null 2>&1; then
+            _has_jq=1
+        else
+            _has_jq=0
+        fi
+    fi
+    [ "$_has_jq" = "1" ]
+}
+
+# json_get <file> <key> — extract a top-level string/number/bool value
+json_get() {
+    local file="$1" key="$2"
+    [ -f "$file" ] || return 1
+    if has_jq; then
+        jq -r ".$key // empty" "$file" 2>/dev/null
+    else
+        # grep-based: handles "key": "value", "key": number, "key": true/false
+        local result
+        result=$(sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$file" | head -1)
+        if [ -z "$result" ]; then
+            result=$(sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*\([0-9][0-9.]*\).*/\1/p' "$file" | head -1)
+        fi
+        if [ -z "$result" ]; then
+            result=$(sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' "$file" | head -1)
+        fi
+        [ -n "$result" ] && echo "$result"
+    fi
+}
+
+# json_get_nested <file> <parent> <key> — extract from nested object
+json_get_nested() {
+    local file="$1" parent="$2" key="$3"
+    [ -f "$file" ] || return 1
+    if has_jq; then
+        jq -r ".$parent.$key // empty" "$file" 2>/dev/null
+    else
+        # Extract the parent block, then the key within it
+        local block
+        block=$(sed -n '/"'"$parent"'"/,/}/p' "$file" 2>/dev/null)
+        if [ -n "$block" ]; then
+            local result
+            result=$(echo "$block" | sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+            if [ -z "$result" ]; then
+                result=$(echo "$block" | sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*\([0-9][0-9.]*\).*/\1/p' | head -1)
+            fi
+            if [ -z "$result" ]; then
+                result=$(echo "$block" | sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' | head -1)
+            fi
+            [ -n "$result" ] && echo "$result"
+        fi
+    fi
+}
+
+# json_get_array <file> <key> — extract a JSON array as space-separated values
+json_get_array() {
+    local file="$1" key="$2"
+    [ -f "$file" ] || return 1
+    if has_jq; then
+        jq -r ".$key // [] | .[]" "$file" 2>/dev/null | tr '\n' ' '
+    else
+        # Extract array block and pull quoted strings
+        sed -n '/"'"$key"'"[[:space:]]*:/,/]/p' "$file" 2>/dev/null \
+            | sed -n 's/.*"\([^"]*\)".*/\1/p' \
+            | grep -v "^${key}$" \
+            | tr '\n' ' '
+    fi
+}
+
+# json_get_nested_array <file> <parent> <key>
+json_get_nested_array() {
+    local file="$1" parent="$2" key="$3"
+    [ -f "$file" ] || return 1
+    if has_jq; then
+        jq -r ".$parent.$key // [] | .[]" "$file" 2>/dev/null | tr '\n' ' '
+    else
+        local block
+        block=$(sed -n '/"'"$parent"'"/,/^[[:space:]]*}/p' "$file" 2>/dev/null)
+        if [ -n "$block" ]; then
+            echo "$block" | sed -n '/"'"$key"'"[[:space:]]*:/,/]/p' \
+                | sed -n 's/.*"\([^"]*\)".*/\1/p' \
+                | grep -v "^${key}$" \
+                | tr '\n' ' '
+        fi
+    fi
+}
+
+# ── Config Loading ─────────────────────────────────────────────────────────────
+
+load_config() {
+    [ -f "$CONFIG_FILE" ] || return 0
+
+    local val
+
+    val=$(json_get "$CONFIG_FILE" "maxRetries")
+    [ -n "$val" ] && CFG_MAX_RETRIES="$val"
+
+    val=$(json_get "$CONFIG_FILE" "pollIntervalSeconds")
+    [ -n "$val" ] && CFG_POLL_INTERVAL="$val"
+
+    val=$(json_get "$CONFIG_FILE" "marginSeconds")
+    [ -n "$val" ] && CFG_MARGIN_SECONDS="$val"
+
+    val=$(json_get "$CONFIG_FILE" "fallbackWaitHours")
+    [ -n "$val" ] && CFG_FALLBACK_WAIT_HOURS="$val"
+
+    val=$(json_get "$CONFIG_FILE" "retryMessage")
+    [ -n "$val" ] && CFG_RETRY_MESSAGE="$val"
+
+    val=$(json_get "$CONFIG_FILE" "logRetentionDays")
+    [ -n "$val" ] && CFG_LOG_RETENTION_DAYS="$val"
+
+    val=$(json_get_array "$CONFIG_FILE" "targets")
+    [ -n "$val" ] && CFG_TARGETS="$val"
+
+    val=$(json_get_array "$CONFIG_FILE" "foregroundCommands")
+    [ -n "$val" ] && CFG_FOREGROUND_CMDS="$val"
+
+    val=$(json_get_array "$CONFIG_FILE" "customPatterns")
+    [ -n "$val" ] && CFG_CUSTOM_PATTERNS="$val"
+
+    # autoModelSwitch nested object
+    val=$(json_get_nested "$CONFIG_FILE" "autoModelSwitch" "enabled")
+    [ -n "$val" ] && CFG_MODEL_SWITCH_ENABLED="$val"
+
+    val=$(json_get_nested_array "$CONFIG_FILE" "autoModelSwitch" "fallbackChain")
+    [ -n "$val" ] && CFG_MODEL_SWITCH_CHAIN="$val"
+
+    val=$(json_get_nested "$CONFIG_FILE" "autoModelSwitch" "switchCommand")
+    [ -n "$val" ] && CFG_MODEL_SWITCH_CMD="$val"
+
+    val=$(json_get_nested "$CONFIG_FILE" "autoModelSwitch" "restoreOriginal")
+    [ -n "$val" ] && CFG_MODEL_SWITCH_RESTORE="$val"
+
+    val=$(json_get_nested "$CONFIG_FILE" "autoModelSwitch" "switchDelaySeconds")
+    [ -n "$val" ] && CFG_MODEL_SWITCH_DELAY="$val"
+}
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+
+ensure_log_dir() {
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+}
+
+today_log() {
+    echo "$LOG_DIR/$(date +%Y-%m-%d).log"
+}
+
+timestamp() {
+    date "+%Y-%m-%d %H:%M:%S"
+}
+
+log_msg() {
+    local level="$1" msg="$2"
+    ensure_log_dir
+    echo "[$(timestamp)] [$level] $msg" >> "$(today_log)"
+}
+
+log_info()  { log_msg "INFO"  "$1"; }
+log_warn()  { log_msg "WARN"  "$1"; }
+log_error() { log_msg "ERROR" "$1"; }
+
+cleanup_logs() {
+    ensure_log_dir
+    local cutoff_days="${CFG_LOG_RETENTION_DAYS:-7}"
+    find "$LOG_DIR" -name "*.log" -type f -mtime +"$cutoff_days" -delete 2>/dev/null || true
+}
+
+# ── ANSI Stripping ─────────────────────────────────────────────────────────────
+
+strip_ansi() {
+    # Remove CSI sequences, OSC sequences, and other escape codes
+    sed \
+        -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' \
+        -e 's/\x1b\][^\x07]*\x07//g' \
+        -e 's/\x1b\][^\x1b]*\x1b\\//g' \
+        -e 's/\x1b[()][AB012]//g' \
+        -e 's/\x1b[>=<]//g' \
+        -e 's/\x1b\[[\?]*[0-9;]*[a-zA-Z]//g' \
+        -e 's/\r//g'
+}
+
+# ── Pattern Detection ──────────────────────────────────────────────────────────
+# Multi-provider rate-limit patterns.
+
+# Returns 0 (true) if rate-limited text is detected, 1 otherwise.
+# Uses the windowed approach: find a "limit" line with a "reset" line within 6 lines.
+is_rate_limited() {
+    local text="${1:-}"
+    [ -z "$text" ] && return 1
+    local stripped
+    stripped=$(printf '%s' "$text" | strip_ansi)
+
+    # Check custom patterns first (full text match)
+    if [ -n "$CFG_CUSTOM_PATTERNS" ]; then
+        local pat
+        for pat in $CFG_CUSTOM_PATTERNS; do
+            if printf '%s' "$stripped" | grep -qEi "$pat"; then
+                return 0
+            fi
+        done
+    fi
+
+    # Limit patterns (any provider) — must be specific to avoid false positives
+    local limit_re='limit reached|hit.*(your|the).*limit|exceeded.*limit|out of.*usage|usage limit|[0-9]+-hour limit|rate limit reached|too many requests|request limit|resource exhausted|quota exceeded|rate limit exceeded|rate limit hit'
+
+    # Reset/time patterns
+    local reset_re='resets? (at )?[0-9]|resets? in[: ]+[0-9]|try again in [0-9]|retry after [0-9]|wait [0-9]'
+
+    # Write lines to a temp file to avoid subshell pipe issues
+    local tmplines
+    tmplines=$(mktemp)
+    printf '%s\n' "$stripped" > "$tmplines"
+
+    local total_lines
+    total_lines=$(wc -l < "$tmplines" | tr -d ' ')
+
+    local line_num=0
+    local found=1  # 1 = not found (shell convention)
+
+    while IFS= read -r line; do
+        line_num=$((line_num + 1))
+        if printf '%s' "$line" | grep -qEi "$limit_re"; then
+            # Check window around this line for reset pattern
+            local win_start=$((line_num - 6))
+            local win_end=$((line_num + 6))
+            [ "$win_start" -lt 1 ] && win_start=1
+            [ "$win_end" -gt "$total_lines" ] && win_end="$total_lines"
+            local window
+            window=$(sed -n "${win_start},${win_end}p" "$tmplines")
+            if printf '%s' "$window" | grep -qEi "$reset_re"; then
+                found=0
+                break
+            fi
+            # Also match self-contained messages: "try again in 5 hours"
+            if printf '%s' "$line" | grep -qEi 'try again in [0-9]'; then
+                found=0
+                break
+            fi
+        fi
+    done < "$tmplines"
+
+    rm -f "$tmplines"
+    return $found
+}
+
+# Extract the reset/time message line for time parsing
+find_reset_message() {
+    local text="${1:-}"
+    [ -z "$text" ] && return 1
+    local stripped
+    stripped=$(printf '%s' "$text" | strip_ansi)
+
+    local reset_re='resets? (at )?[0-9]|resets? in[: ]+[0-9]|try again in [0-9]|retry after [0-9]|wait [0-9]'
+
+    printf '%s\n' "$stripped" | grep -Ei "$reset_re" | head -1
+}
+
+# ── Time Parsing ───────────────────────────────────────────────────────────────
+# Parse reset times from rate-limit messages. Handles:
+#   - Absolute: "resets 3pm", "resets at 3:30 PM (UTC)", "resets 15:00"
+#   - Relative: "try again in 5 hours", "wait 30 minutes"
+
+# Detect GNU vs BSD date
+_date_type=""
+detect_date_type() {
+    if [ -n "$_date_type" ]; then return; fi
+    if date -d "2024-01-01" "+%s" >/dev/null 2>&1; then
+        _date_type="gnu"
+    else
+        _date_type="bsd"
+    fi
+}
+
+# date_to_epoch <date_string> — convert to epoch seconds
+date_to_epoch() {
+    detect_date_type
+    if [ "$_date_type" = "gnu" ]; then
+        date -d "$1" "+%s" 2>/dev/null
+    else
+        date -j -f "%Y-%m-%d %H:%M:%S" "$1" "+%s" 2>/dev/null
+    fi
+}
+
+# Parse the reset message and output wait seconds
+calculate_wait_seconds() {
+    local message="$1"
+    local now_epoch
+    now_epoch=$(date "+%s")
+
+    # Try relative time first: "try again in 5 hours", "wait 30 minutes"
+    local rel_match
+    rel_match=$(echo "$message" | grep -oEi '[0-9]+ *(hours?|minutes?|mins?|h|m)\b' | head -1)
+    if [ -n "$rel_match" ]; then
+        local amount unit
+        amount=$(echo "$rel_match" | grep -oE '[0-9]+')
+        unit=$(echo "$rel_match" | grep -oEi '(hours?|minutes?|mins?|h|m)' | tr '[:upper:]' '[:lower:]')
+        case "$unit" in
+            h|hour|hours)   echo $(( amount * 3600 + CFG_MARGIN_SECONDS )); return 0 ;;
+            m|min|mins|minute|minutes) echo $(( amount * 60 + CFG_MARGIN_SECONDS )); return 0 ;;
+        esac
+    fi
+
+    # Try absolute time: "resets 3pm", "resets at 3:30 PM (UTC)"
+    local abs_match
+    abs_match=$(echo "$message" | grep -oEi '[0-9]{1,2}(:[0-9]{2})? *(am|pm)?' | head -1)
+    if [ -n "$abs_match" ]; then
+        local hour minute ampm
+        hour=$(echo "$abs_match" | grep -oE '^[0-9]{1,2}')
+        minute=$(echo "$abs_match" | grep -oE ':[0-9]{2}' | tr -d ':')
+        ampm=$(echo "$abs_match" | grep -oEi '(am|pm)' | tr '[:upper:]' '[:lower:]')
+        [ -z "$minute" ] && minute=0
+
+        if [ -n "$ampm" ]; then
+            if [ "$ampm" = "pm" ] && [ "$hour" -ne 12 ]; then
+                hour=$((hour + 12))
+            elif [ "$ampm" = "am" ] && [ "$hour" -eq 12 ]; then
+                hour=0
+            fi
+        fi
+
+        # Extract timezone if present: (UTC), (Europe/Dublin), etc.
+        local tz
+        tz=$(echo "$message" | grep -oE '\([A-Za-z/_+-]+\)' | tr -d '()' | head -1)
+
+        # Compute target time
+        local target_epoch
+        local today
+        today=$(date "+%Y-%m-%d")
+        local target_str
+        target_str=$(printf "%s %02d:%02d:00" "$today" "$hour" "$minute")
+
+        if [ -n "$tz" ]; then
+            # Use TZ environment variable for timezone conversion
+            detect_date_type
+            if [ "$_date_type" = "gnu" ]; then
+                target_epoch=$(TZ="$tz" date -d "$target_str" "+%s" 2>/dev/null)
+            else
+                target_epoch=$(TZ="$tz" date -j -f "%Y-%m-%d %H:%M:%S" "$target_str" "+%s" 2>/dev/null)
+            fi
+        else
+            target_epoch=$(date_to_epoch "$target_str")
+        fi
+
+        if [ -n "$target_epoch" ]; then
+            local diff=$((target_epoch - now_epoch))
+
+            # Handle ambiguous times (no am/pm, 1-12 range)
+            if [ -z "$ampm" ] && [ "$hour" -ge 1 ] && [ "$hour" -le 12 ]; then
+                local alt_hour=$((hour + 12))
+                local alt_str
+                alt_str=$(printf "%s %02d:%02d:00" "$today" "$alt_hour" "$minute")
+                local alt_epoch
+                if [ -n "$tz" ]; then
+                    detect_date_type
+                    if [ "$_date_type" = "gnu" ]; then
+                        alt_epoch=$(TZ="$tz" date -d "$alt_str" "+%s" 2>/dev/null)
+                    else
+                        alt_epoch=$(TZ="$tz" date -j -f "%Y-%m-%d %H:%M:%S" "$alt_str" "+%s" 2>/dev/null)
+                    fi
+                else
+                    alt_epoch=$(date_to_epoch "$alt_str")
+                fi
+                if [ -n "$alt_epoch" ]; then
+                    local alt_diff=$((alt_epoch - now_epoch))
+                    # Pick the soonest future time
+                    if [ "$diff" -le 0 ] && [ "$alt_diff" -gt 0 ]; then
+                        diff="$alt_diff"
+                    elif [ "$alt_diff" -gt 0 ] && [ "$alt_diff" -lt "$diff" ]; then
+                        diff="$alt_diff"
+                    fi
+                fi
+            fi
+
+            # If target is in the past, add 24 hours
+            if [ "$diff" -le 0 ]; then
+                diff=$((diff + 86400))
+            fi
+
+            echo $((diff + CFG_MARGIN_SECONDS))
+            return 0
+        fi
+    fi
+
+    # Fallback: couldn't parse, use fallback wait hours
+    echo $(( CFG_FALLBACK_WAIT_HOURS * 3600 + CFG_MARGIN_SECONDS ))
+}
+
+# ── tmux Helpers ───────────────────────────────────────────────────────────────
+
+is_inside_tmux() {
+    [ -n "${TMUX:-}" ]
+}
+
+current_pane() {
+    echo "${TMUX_PANE:-}"
+}
+
+capture_pane() {
+    local pane="$1" lines="${2:-20}"
+    tmux capture-pane -t "$pane" -p -S "-${lines}" 2>/dev/null || echo ""
+}
+
+send_keys() {
+    local pane="$1" text="$2"
+    tmux send-keys -t "$pane" "$text" Enter 2>/dev/null
+}
+
+get_pane_command() {
+    local pane="$1"
+    tmux display-message -t "$pane" -p '#{pane_current_command}' 2>/dev/null || echo ""
+}
+
+is_process_alive() {
+    local pid="$1"
+    kill -0 "$pid" 2>/dev/null
+}
+
+is_foreground_claude() {
+    local pid="$1"
+    local stat
+    stat=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')
+    case "$stat" in
+        *+*) return 0 ;;  # '+' flag means foreground process group
+        *)   return 1 ;;
+    esac
+}
+
+check_pane_foreground() {
+    local pane="$1" pid="$2"
+    # First try: check if the process itself is in the foreground group
+    if is_foreground_claude "$pid"; then
+        return 0
+    fi
+    # Fallback: check the pane's current command
+    local fg
+    fg=$(get_pane_command "$pane")
+    fg=$(echo "$fg" | tr '[:upper:]' '[:lower:]')
+    local cmd
+    for cmd in $CFG_FOREGROUND_CMDS; do
+        case "$fg" in
+            *"$cmd"*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# ── Monitor ────────────────────────────────────────────────────────────────────
+# Background process: polls tmux pane, detects rate limits, retries or switches.
+
+monitor_loop() {
+    local pane="$1" pid="$2" tool="$3"
+
+    load_config
+    log_info "Monitor started for pane $pane ($tool PID: $pid)"
+    cleanup_logs
+
+    local status="monitoring"
+    local wait_until=0
+    local attempts=0
+    local consecutive_errors=0
+    local max_consecutive_errors=10
+    local last_rate_msg=""
+
+    # Model switch state
+    local fallback_index=0
+    local original_model=""
+    local on_fallback="false"
+    local fallback_list=""
+    if [ "$CFG_MODEL_SWITCH_ENABLED" = "true" ] && [ -n "$CFG_MODEL_SWITCH_CHAIN" ]; then
+        fallback_list="$CFG_MODEL_SWITCH_CHAIN"
+    fi
+
+    # Count fallback models
+    local fallback_count=0
+    if [ -n "$fallback_list" ]; then
+        for _ in $fallback_list; do
+            fallback_count=$((fallback_count + 1))
+        done
+    fi
+
+    # Get nth element from space-separated list
+    get_nth() {
+        local list="$1" n="$2" i=0
+        for item in $list; do
+            if [ "$i" -eq "$n" ]; then
+                echo "$item"
+                return
+            fi
+            i=$((i + 1))
+        done
+    }
+
+    while true; do
+        sleep "$CFG_POLL_INTERVAL"
+
+        # Check if the process is still alive
+        if ! is_process_alive "$pid"; then
+            log_info "$tool exited (PID $pid). Monitor shutting down."
+            exit 0
+        fi
+
+        # Capture pane content
+        local content
+        content=$(capture_pane "$pane" 20) || {
+            consecutive_errors=$((consecutive_errors + 1))
+            if [ "$consecutive_errors" -ge "$max_consecutive_errors" ]; then
+                log_error "$max_consecutive_errors consecutive errors. Pane likely destroyed. Exiting."
+                exit 1
+            fi
+            continue
+        }
+        consecutive_errors=0
+
+        if [ "$status" = "waiting" ]; then
+            local now_epoch
+            now_epoch=$(date "+%s")
+
+            if [ "$now_epoch" -lt "$wait_until" ]; then
+                continue
+            fi
+
+            # Check if rate limit cleared (user continued or time passed)
+            if ! is_rate_limited "$content"; then
+                log_info "Rate limit cleared. Resuming monitoring."
+                status="monitoring"
+                attempts=0
+
+                # Restore original model if we switched
+                if [ "$on_fallback" = "true" ] && [ "$CFG_MODEL_SWITCH_RESTORE" = "true" ] && [ -n "$original_model" ]; then
+                    log_info "Restoring original model: $original_model"
+                    send_keys "$pane" "$CFG_MODEL_SWITCH_CMD $original_model"
+                    sleep "$CFG_MODEL_SWITCH_DELAY"
+                    on_fallback="false"
+                    fallback_index=0
+                fi
+                continue
+            fi
+
+            # Max retries reached — keep monitoring but don't send more retries
+            if [ "$attempts" -ge "$CFG_MAX_RETRIES" ]; then
+                log_warn "Max retries ($CFG_MAX_RETRIES) reached. Still monitoring, waiting for rate limit to clear."
+                wait_until=$((now_epoch + CFG_POLL_INTERVAL * 12))
+                continue
+            fi
+
+            # Verify the tool is still in the foreground
+            if ! check_pane_foreground "$pane" "$pid"; then
+                local fg
+                fg=$(get_pane_command "$pane")
+                log_warn "Foreground is \"$fg\", not $tool. Skipping send-keys."
+                wait_until=$((now_epoch + CFG_POLL_INTERVAL * 6))
+                continue
+            fi
+
+            # Attempt retry (possibly with model switch)
+            attempts=$((attempts + 1))
+
+            if [ "$CFG_MODEL_SWITCH_ENABLED" = "true" ] && [ "$fallback_count" -gt 0 ] && [ "$fallback_index" -lt "$fallback_count" ]; then
+                # Record original model on first switch
+                if [ "$fallback_index" -eq 0 ] && [ -z "$original_model" ]; then
+                    # Try to detect current model from pane content — best effort
+                    # For now, user must set it via config or we skip restore
+                    original_model=$(echo "$content" | strip_ansi | grep -oEi 'model: [^ ]+' | head -1 | sed 's/model: //i')
+                fi
+
+                local next_model
+                next_model=$(get_nth "$fallback_list" "$fallback_index")
+                fallback_index=$((fallback_index + 1))
+                on_fallback="true"
+
+                log_info "Switching to fallback model: $next_model (attempt $attempts)"
+                send_keys "$pane" "$CFG_MODEL_SWITCH_CMD $next_model"
+                sleep "$CFG_MODEL_SWITCH_DELAY"
+                send_keys "$pane" "$CFG_RETRY_MESSAGE"
+            else
+                log_info "Sent retry message (attempt $attempts)"
+                send_keys "$pane" "$CFG_RETRY_MESSAGE"
+            fi
+
+            # Cooldown after sending keys
+            wait_until=$((now_epoch + 30))
+            continue
+        fi
+
+        # status == "monitoring" — check for rate limit
+        if is_rate_limited "$content"; then
+            local reset_msg
+            reset_msg=$(find_reset_message "$content")
+            last_rate_msg="$reset_msg"
+
+            local wait_secs
+            if [ -n "$reset_msg" ]; then
+                wait_secs=$(calculate_wait_seconds "$reset_msg")
+            else
+                wait_secs=$(( CFG_FALLBACK_WAIT_HOURS * 3600 + CFG_MARGIN_SECONDS ))
+            fi
+
+            local now_epoch
+            now_epoch=$(date "+%s")
+            wait_until=$((now_epoch + wait_secs))
+            status="waiting"
+
+            log_info "Rate limit detected: \"$reset_msg\". Waiting ${wait_secs}s..."
+        fi
+    done
+}
+
+# ── Launcher ───────────────────────────────────────────────────────────────────
+# Orchestrates: finds the tool binary, spawns it, starts background monitor.
+
+find_tool_binary() {
+    local tool="$1"
+    command -v "$tool" 2>/dev/null || echo "$tool"
+}
+
+shell_escape() {
+    printf "'"
+    printf '%s' "$1" | sed "s/'/'\\\\''/g"
+    printf "'"
+}
+
+launch_interactive() {
+    local tool="$1"
+    shift
+    local tool_bin
+    tool_bin=$(find_tool_binary "$tool")
+    local pane
+    pane=$(current_pane)
+
+    if [ -z "$pane" ]; then
+        log_error "Not in a tmux pane. Cannot monitor."
+        exec "$tool_bin" "$@"
+        return
+    fi
+
+    # Start the tool in the foreground
+    "$tool_bin" "$@" &
+    local tool_pid=$!
+
+    # Start background monitor
+    "$SCRIPT_PATH" monitor "$pane" "$tool_pid" "$tool" &
+    local monitor_pid=$!
+    disown "$monitor_pid" 2>/dev/null || true
+
+    # Forward signals to the tool
+    trap 'kill -INT "$tool_pid" 2>/dev/null' INT
+    trap 'kill -TERM "$tool_pid" 2>/dev/null' TERM
+    trap 'kill -WINCH "$tool_pid" 2>/dev/null' WINCH 2>/dev/null || true
+
+    # Wait for the tool to finish
+    wait "$tool_pid" 2>/dev/null
+    local exit_code=$?
+
+    # Kill the monitor
+    kill "$monitor_pid" 2>/dev/null || true
+
+    return "$exit_code"
+}
+
+launch_print_mode() {
+    local tool="$1"
+    shift
+    local tool_bin
+    tool_bin=$(find_tool_binary "$tool")
+    local retries=0
+
+    while true; do
+        local output
+        output=$("$tool_bin" "$@" 2>&1) || true
+        local exit_code=$?
+
+        if ! is_rate_limited "$output"; then
+            echo "$output"
+            return "$exit_code"
+        fi
+
+        retries=$((retries + 1))
+        if [ "$retries" -gt "$CFG_MAX_RETRIES" ]; then
+            echo "[ai-cli-auto-retry] Max retries ($CFG_MAX_RETRIES) reached." >&2
+            return 1
+        fi
+
+        local reset_msg
+        reset_msg=$(find_reset_message "$output")
+        local wait_secs
+        if [ -n "$reset_msg" ]; then
+            wait_secs=$(calculate_wait_seconds "$reset_msg")
+        else
+            wait_secs=$(( CFG_FALLBACK_WAIT_HOURS * 3600 + CFG_MARGIN_SECONDS ))
+        fi
+
+        echo "[ai-cli-auto-retry] Rate limited. Waiting ${wait_secs}s before retry ${retries}/${CFG_MAX_RETRIES}..." >&2
+        sleep "$wait_secs"
+    done
+}
+
+is_print_mode() {
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            -p|--print) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+ensure_tmux() {
+    local tool="$1"
+    shift
+    local session_name="ai-cli-auto-retry-$$-$(date +%s)"
+
+    # Build the command to run inside tmux
+    local escaped_script
+    escaped_script=$(shell_escape "$SCRIPT_PATH")
+    local escaped_args=""
+    local arg
+    for arg in "$@"; do
+        escaped_args="$escaped_args $(shell_escape "$arg")"
+    done
+    local inner_cmd="AUTO_RETRY_ACTIVE=1 $escaped_script launch $tool$escaped_args; exec \${SHELL:-bash}"
+
+    tmux new-session -d -s "$session_name" "$inner_cmd" 2>/dev/null || {
+        echo "[ai-cli-auto-retry] Failed to create tmux session." >&2
+        return 1
+    }
+
+    # Attach to the session
+    exec tmux attach-session -t "$session_name"
+}
+
+cmd_launch() {
+    local tool="${1:-}"
+    if [ -z "$tool" ]; then
+        echo "Usage: ai-cli-auto-retry launch <tool> [args...]" >&2
+        return 1
+    fi
+    shift
+
+    load_config
+
+    if is_print_mode "$@"; then
+        launch_print_mode "$tool" "$@"
+        return $?
+    fi
+
+    if is_inside_tmux; then
+        launch_interactive "$tool" "$@"
+        return $?
+    fi
+
+    ensure_tmux "$tool" "$@"
+}
+
+# ── CLI Commands ───────────────────────────────────────────────────────────────
+
+check_tmux() {
+    if ! command -v tmux >/dev/null 2>&1; then
+        return 1
+    fi
+    local ver
+    ver=$(tmux -V 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    if [ -z "$ver" ]; then
+        echo "Could not detect tmux version." >&2
+        return 1
+    fi
+    # Compare version (need >= 2.1)
+    local major minor
+    major=$(echo "$ver" | cut -d. -f1)
+    minor=$(echo "$ver" | cut -d. -f2)
+    if [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -lt 1 ]; }; then
+        echo "tmux $ver is too old. Requires >= 2.1." >&2
+        return 1
+    fi
+    return 0
+}
+
+install_tmux() {
+    echo "tmux not found. Attempting to install..."
+    if [ "$(uname)" = "Darwin" ]; then
+        if command -v brew >/dev/null 2>&1; then
+            brew install tmux
+        else
+            echo "Please install tmux: brew install tmux" >&2
+            return 1
+        fi
+    elif command -v apt-get >/dev/null 2>&1; then
+        sudo apt-get install -y tmux
+    elif command -v dnf >/dev/null 2>&1; then
+        sudo dnf install -y tmux
+    elif command -v pacman >/dev/null 2>&1; then
+        sudo pacman -S --noconfirm tmux
+    elif command -v apk >/dev/null 2>&1; then
+        sudo apk add tmux
+    else
+        echo "Could not detect package manager. Please install tmux manually." >&2
+        return 1
+    fi
+}
+
+generate_wrapper() {
+    local tool="$1" script_path="$2"
+    cat <<WRAPPER
+${tool}() {
+  if [ "\${AUTO_RETRY_ACTIVE}" = "1" ]; then
+    command ${tool} "\$@"; return \$?
+  fi
+  local _ar_old_int _ar_old_term
+  _ar_old_int=\$(trap -p INT)
+  _ar_old_term=\$(trap -p TERM)
+  trap 'unset AUTO_RETRY_ACTIVE' INT TERM
+  AUTO_RETRY_ACTIVE=1 ${script_path} launch ${tool} "\$@"
+  local _ar_exit=\$?
+  unset AUTO_RETRY_ACTIVE
+  eval "\${_ar_old_int:-trap - INT}"
+  eval "\${_ar_old_term:-trap - TERM}"
+  return \$_ar_exit
+}
+WRAPPER
+}
+
+cmd_install() {
+    echo "ai-cli-auto-retry v$VERSION: installing..."
+    echo ""
+
+    # Check/install tmux
+    if ! check_tmux; then
+        install_tmux || exit 1
+        if ! check_tmux; then
+            echo "tmux installation failed." >&2
+            exit 1
+        fi
+    fi
+    echo "✓ tmux OK"
+
+    load_config
+
+    # Determine which shell RC files to modify
+    local shell_name
+    shell_name=$(basename "${SHELL:-/bin/bash}")
+
+    if [ "$shell_name" = "fish" ]; then
+        echo ""
+        echo "Fish shell detected. Automatic install not supported."
+        echo "Add manually to ~/.config/fish/config.fish:"
+        local t
+        for t in $CFG_TARGETS; do
+            echo "  function $t; set -x AUTO_RETRY_ACTIVE 1; $SCRIPT_PATH launch $t \$argv; set -e AUTO_RETRY_ACTIVE; end"
+        done
+        exit 1
+    fi
+
+    local rc_files=""
+    local bashrc="$HOME/.bashrc"
+    local zshrc="$HOME/.zshrc"
+
+    if [ -f "$bashrc" ] || [ "$shell_name" = "bash" ]; then
+        rc_files="$rc_files $bashrc"
+    fi
+    if [ -f "$zshrc" ] || [ "$shell_name" = "zsh" ]; then
+        rc_files="$rc_files $zshrc"
+    fi
+    if [ -z "$rc_files" ]; then
+        rc_files="$bashrc"
+    fi
+
+    # Build the wrapper block
+    local wrapper_block="$MARKER_START"
+    local t
+    for t in $CFG_TARGETS; do
+        wrapper_block="$wrapper_block
+$(generate_wrapper "$t" "$SCRIPT_PATH")"
+    done
+    wrapper_block="$wrapper_block
+$MARKER_END"
+
+    # Inject into each RC file
+    local rc
+    for rc in $rc_files; do
+        # Remove existing block if present
+        if [ -f "$rc" ] && grep -q "$MARKER_START" "$rc"; then
+            # Create temp file without the old block
+            local tmpf
+            tmpf=$(mktemp)
+            sed "/$MARKER_START/,/$MARKER_END/d" "$rc" > "$tmpf"
+            mv "$tmpf" "$rc"
+        fi
+
+        # Append new block
+        [ -f "$rc" ] || touch "$rc"
+        {
+            echo ""
+            echo "$wrapper_block"
+        } >> "$rc"
+
+        echo "✓ Shell wrappers added to $rc"
+    done
+
+    echo ""
+    echo "Installed! Wrapping: $CFG_TARGETS"
+    echo ""
+    echo "Restart your shell or run:"
+    for rc in $rc_files; do
+        echo "  source $rc"
+    done
+
+    if [ "$CFG_MODEL_SWITCH_ENABLED" = "true" ]; then
+        echo ""
+        echo "Auto model switching is ENABLED."
+        echo "Fallback chain: $CFG_MODEL_SWITCH_CHAIN"
+    else
+        echo ""
+        echo "Auto model switching is disabled (default)."
+        echo "Enable it in $CONFIG_FILE:"
+        echo '  { "autoModelSwitch": { "enabled": true, "fallbackChain": ["model-a", "model-b"] } }'
+    fi
+}
+
+cmd_uninstall() {
+    local bashrc="$HOME/.bashrc"
+    local zshrc="$HOME/.zshrc"
+    local rc
+    for rc in "$bashrc" "$zshrc"; do
+        if [ -f "$rc" ] && grep -q "$MARKER_START" "$rc"; then
+            local tmpf
+            tmpf=$(mktemp)
+            sed "/$MARKER_START/,/$MARKER_END/d" "$rc" > "$tmpf"
+            # Clean up trailing blank lines
+            sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$tmpf" > "${tmpf}.clean" 2>/dev/null || cp "$tmpf" "${tmpf}.clean"
+            mv "${tmpf}.clean" "$rc"
+            rm -f "$tmpf"
+            echo "✓ Removed from $rc"
+        fi
+    done
+    echo "Shell wrappers removed. Restart your shell to complete."
+}
+
+cmd_status() {
+    local logfile
+    logfile=$(today_log)
+    if [ -f "$logfile" ]; then
+        echo "Log file: $logfile"
+        echo ""
+        echo "Last 10 entries:"
+        tail -10 "$logfile"
+    else
+        echo "No activity today. Log directory: $LOG_DIR"
+    fi
+}
+
+cmd_logs() {
+    local logfile
+    logfile=$(today_log)
+    if [ -f "$logfile" ]; then
+        tail -f "$logfile"
+    else
+        echo "No log file for today: $logfile"
+    fi
+}
+
+cmd_version() {
+    echo "$VERSION"
+}
+
+cmd_help() {
+    cat <<HELP
+ai-cli-auto-retry v$VERSION — Universal rate-limit auto-retry & model switching
+
+Usage:
+  ai-cli-auto-retry install       Install shell wrappers + check tmux
+  ai-cli-auto-retry uninstall     Remove shell wrappers
+  ai-cli-auto-retry status        Show monitor activity
+  ai-cli-auto-retry logs          Tail today's log
+  ai-cli-auto-retry version       Print version
+  ai-cli-auto-retry help          Show this help
+
+Configuration:
+  $CONFIG_FILE
+
+Supported tools: pi, claude, and any CLI (configure via "targets" in config)
+
+Auto model switching (opt-in):
+  Set "autoModelSwitch.enabled": true in $CONFIG_FILE
+  Configure "autoModelSwitch.fallbackChain" with ordered model list
+
+More info: https://github.com/your-user/ai-cli-auto-retry
+HELP
+}
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+main() {
+    local cmd="${1:-help}"
+
+    case "$cmd" in
+        install)
+            cmd_install
+            ;;
+        uninstall)
+            cmd_uninstall
+            ;;
+        status)
+            cmd_status
+            ;;
+        logs)
+            cmd_logs
+            ;;
+        version|--version|-v)
+            cmd_version
+            ;;
+        help|--help|-h)
+            cmd_help
+            ;;
+        launch)
+            shift
+            cmd_launch "$@"
+            ;;
+        monitor)
+            shift
+            local pane="${1:-}" pid="${2:-}" tool="${3:-}"
+            if [ -z "$pane" ] || [ -z "$pid" ] || [ -z "$tool" ]; then
+                echo "Usage: ai-cli-auto-retry monitor <pane> <pid> <tool>" >&2
+                exit 1
+            fi
+            monitor_loop "$pane" "$pid" "$tool"
+            ;;
+        *)
+            echo "Unknown command: $cmd" >&2
+            echo "Run 'ai-cli-auto-retry help' for usage." >&2
+            exit 1
+            ;;
+    esac
+}
+
+# Only run main when executed directly, not when sourced
+if [ "${AUTO_RETRY_SOURCED:-}" != "1" ]; then
+    main "$@"
+fi
