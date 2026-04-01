@@ -708,28 +708,20 @@ launch_interactive() {
         return
     fi
 
-    # Start the tool in the foreground
-    "$tool_bin" "$@" &
-    local tool_pid=$!
-
-    # Start background monitor
-    "$SCRIPT_PATH" monitor "$pane" "$tool_pid" "$tool" &
+    # Start background monitor FIRST (before taking over TTY)
+    "$SCRIPT_PATH" monitor "$pane" "$$" "$tool" &
     local monitor_pid=$!
     disown "$monitor_pid" 2>/dev/null || true
 
-    # Forward signals to the tool
-    trap 'kill -INT "$tool_pid" 2>/dev/null' INT
-    trap 'kill -TERM "$tool_pid" 2>/dev/null' TERM
-    trap 'kill -WINCH "$tool_pid" 2>/dev/null' WINCH 2>/dev/null || true
+    # Forward SIGWINCH for terminal resize
+    trap 'kill -WINCH $$ 2>/dev/null' WINCH 2>/dev/null || true
 
-    # Wait for the tool to finish
-    wait "$tool_pid" 2>/dev/null
-    local exit_code=$?
+    # Restore default signal handlers for INT/TERM (let them kill us naturally)
+    trap - INT TERM
 
-    # Kill the monitor
-    kill "$monitor_pid" 2>/dev/null || true
-
-    return "$exit_code"
+    # Run the tool in FOREGROUND with exec - this gives it full TTY control
+    # The monitor runs independently in the background
+    exec "$tool_bin" "$@"
 }
 
 launch_print_mode() {
