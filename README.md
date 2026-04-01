@@ -119,6 +119,8 @@ Optional. Create `~/.ai-cli-auto-retry.json`:
     "restoreOriginal": true,
     "switchDelaySeconds": 3
   },
+  "claudeDialogOption": "1",
+  "claudeDialogDelay": 2,
   "customPatterns": [],
   "foregroundCommands": ["node", "claude", "pi", "npx", "tsx", "bun", "deno"],
   "logRetentionDays": 7
@@ -138,6 +140,8 @@ Optional. Create `~/.ai-cli-auto-retry.json`:
 | `autoModelSwitch.switchCommand` | `"/model"` | Command to switch models |
 | `autoModelSwitch.restoreOriginal` | `true` | Switch back after rate limit clears |
 | `autoModelSwitch.switchDelaySeconds` | `3` | Wait between switch and retry |
+| `claudeDialogOption` | `"1"` | Claude dialog option: "1"=Stop&wait, "2"=Extra usage, "3"=Upgrade |
+| `claudeDialogDelay` | `2` | Seconds to wait after selecting dialog option |
 | `customPatterns` | `[]` | Additional regex patterns (grep -E) |
 | `foregroundCommands` | `["node", ...]` | Process names considered safe for send-keys |
 | `logRetentionDays` | `7` | Days to keep log files |

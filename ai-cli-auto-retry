@@ -34,6 +34,10 @@ CFG_MODEL_SWITCH_DELAY=3
 
 CFG_CUSTOM_PATTERNS=""
 
+# Claude dialog handling
+CFG_CLAUDE_DIALOG_OPTION="1"  # Default: "Stop and wait for limit to reset"
+CFG_CLAUDE_DIALOG_DELAY=2      # Seconds to wait after selecting dialog option
+
 # ── JSON Helpers ───────────────────────────────────────────────────────────────
 # Lightweight JSON field extraction. Uses jq if available, falls back to grep/sed.
 
@@ -178,6 +182,13 @@ load_config() {
 
     val=$(json_get_nested "$CONFIG_FILE" "autoModelSwitch" "switchDelaySeconds")
     [ -n "$val" ] && CFG_MODEL_SWITCH_DELAY="$val"
+
+    # Claude dialog handling
+    val=$(json_get "$CONFIG_FILE" "claudeDialogOption")
+    [ -n "$val" ] && CFG_CLAUDE_DIALOG_OPTION="$val"
+
+    val=$(json_get "$CONFIG_FILE" "claudeDialogDelay")
+    [ -n "$val" ] && CFG_CLAUDE_DIALOG_DELAY="$val"
 }
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -599,6 +610,25 @@ monitor_loop() {
 
             # Attempt retry (possibly with model switch)
             attempts=$((attempts + 1))
+
+            # Check if Claude dialog is visible and handle it first
+            local has_dialog=0
+            if echo "$content" | strip_ansi | grep -qi "What do you want to do?"; then
+                has_dialog=1
+            fi
+            if echo "$content" | strip_ansi | grep -qi "Stop and wait for limit"; then
+                has_dialog=1
+            fi
+            if echo "$content" | strip_ansi | grep -qi "Switch to extra usage"; then
+                has_dialog=1
+            fi
+
+            if [ "$has_dialog" -eq 1 ]; then
+                log_info "Claude dialog detected. Selecting option $CFG_CLAUDE_DIALOG_OPTION..."
+                # Send the dialog option number (1, 2, or 3)
+                send_keys "$pane" "$CFG_CLAUDE_DIALOG_OPTION"
+                sleep "$CFG_CLAUDE_DIALOG_DELAY"
+            fi
 
             if [ "$CFG_MODEL_SWITCH_ENABLED" = "true" ] && [ "$fallback_count" -gt 0 ] && [ "$fallback_index" -lt "$fallback_count" ]; then
                 # Record original model on first switch
