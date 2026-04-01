@@ -450,6 +450,66 @@ assert_eq "no match for 'bash'" "no-match" "$(test_fg_match "node claude pi" "ba
 
 echo ""
 
+# ── Tests: Claude Dialog Detection ────────────────────────────────────────────
+
+echo "Claude Dialog Detection:"
+
+test_dialog_detect() {
+    local text="$1"
+    local has_dialog=0
+    if echo "$text" | grep -qi "What do you want to do?"; then
+        has_dialog=1
+    fi
+    if echo "$text" | grep -qi "Stop and wait for limit"; then
+        has_dialog=1
+    fi
+    if echo "$text" | grep -qi "Switch to extra usage"; then
+        has_dialog=1
+    fi
+    echo "$has_dialog"
+}
+
+result=$(test_dialog_detect "What do you want to do?
+
+  ❯ 1. Stop and wait for limit to reset
+    2. Switch to extra usage
+    3. Upgrade your plan")
+assert_eq "detects full Claude dialog" "1" "$result"
+
+result=$(test_dialog_detect "Stop and wait for limit to reset")
+assert_eq "detects 'Stop and wait' option" "1" "$result"
+
+result=$(test_dialog_detect "Switch to extra usage")
+assert_eq "detects 'Switch to extra usage' option" "1" "$result"
+
+result=$(test_dialog_detect "Continue where you left off.")
+assert_eq "does not match normal text" "0" "$result"
+
+# Test config loading for dialog options
+test_dialog_config() {
+    local tmpconf
+    tmpconf=$(mktemp)
+    cat > "$tmpconf" <<'JSON'
+{
+  "claudeDialogOption": "2",
+  "claudeDialogDelay": 5
+}
+JSON
+    (
+        AUTO_RETRY_SOURCED=1
+        CONFIG_FILE="$tmpconf"
+        source "$AUTO_RETRY"
+        load_config
+        echo "$CFG_CLAUDE_DIALOG_OPTION|$CFG_CLAUDE_DIALOG_DELAY"
+    )
+    rm -f "$tmpconf"
+}
+
+result=$(test_dialog_config)
+assert_eq "reads claudeDialogOption config" "2|5" "$result"
+
+echo ""
+
 # ── Summary ────────────────────────────────────────────────────────────────────
 
 echo "════════════════════════════════════════"
