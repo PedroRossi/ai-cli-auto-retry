@@ -213,26 +213,9 @@ ai-cli-auto-retry uninstall
 rm ~/.local/bin/ai-cli-auto-retry  # or wherever you put it
 ```
 
-## Compared to claude-auto-retry
+## Acknowledgments
 
-| Feature | claude-auto-retry | ai-cli-auto-retry |
-|---------|-------------------|------------|
-| Language | Node.js (~40MB RSS) | Bash (< 1MB RSS) |
-| Dependencies | Node.js >= 18 | None (bash + tmux) |
-| Distribution | `npm i -g` | Single file, `curl` install |
-| Providers | Claude only | Any provider |
-| Model switching | No | Yes (opt-in) |
-| Target tools | Claude Code only | pi, claude, any |
-| Custom patterns | Yes | Yes |
-| macOS compat | Needs Node.js | Stock bash 3.2 |
-
-## Development
-
-```bash
-git clone https://github.com/your-user/ai-cli-auto-retry
-cd ai-cli-auto-retry
-./test/test.sh    # Run 51 tests
-```
+This project was inspired by [claude-auto-retry](https://github.com/cheapestinference/claude-auto-retry) by CheapestInference. The original tool pioneered the approach of monitoring tmux panes for rate limit messages and automatically retrying. ai-cli-auto-retry extends this concept with multi-provider support, auto model switching, and a pure Bash implementation.
 
 ## License
 
